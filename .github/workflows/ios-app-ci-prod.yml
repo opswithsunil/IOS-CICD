@@ -1,0 +1,126 @@
+name: IOS App
+
+on:
+  push:
+    tags:
+      - 'v*.*.*' 
+      
+jobs:
+  Build_and_Upload_IOS_APP_on_TestFlight:
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: release version
+      run: |
+        TAG_NAME=$(echo "${GITHUB_REF#refs/tags/}")
+        NUMERIC_TAG=${TAG_NAME#v}
+
+        if [ "$NUMERIC_TAG" == "${{ vars.PRODUCTION_VERSION }}" ]; then
+            echo "Sementic Tag: $NUMERIC_TAG"
+            echo "new_version=$NUMERIC_TAG" >> $GITHUB_ENV
+            buildNumber=$((${{ vars.PRODUCTION_BUILD_NUMBER }} + 1))
+            echo "BuildNumber Tag: $buildNumber"
+            echo "buildNumber=$buildNumber" >> $GITHUB_ENV
+        else
+            echo "Sementic Tag: $NUMERIC_TAG"
+            echo "new_version=$NUMERIC_TAG" >> $GITHUB_ENV
+            buildNumber=1
+            echo "BuildNumber Tag: $buildNumber"
+            echo "buildNumber=$buildNumber" >> $GITHUB_ENV
+        fi
+
+    - name: Set up Node.js 20.9.0
+      uses: actions/setup-node@v3
+      with:
+        node-version: 20.9.0
+
+    - name: Cognito Env
+      run: |
+        echo AWS_REGION=${{ secrets.AWS_REGION }} >> .env
+        echo AWS_USER_POOL_ENDPOINT=${{ secrets.AWS_USER_POOL_ENDPOINT }} >> .env
+        echo AWS_CLIENT_ID=${{ secrets.AWS_CLIENT_ID }} >> .env
+        echo AWS_USER_POOL_ID=${{ secrets.AWS_USER_POOL_ID }} >> .env
+
+    - name: Set up npm 10.1.0
+      run: npm install -g npm@10.1.0
+
+    - name: Install dependencies
+      run: npm i
+
+    - name: Install certificate
+      run: |
+        chmod +x ./install_certificate.sh
+        ./install_certificate.sh
+      env:
+        APPLE_DISTRIBUTION_CERTIFICATE_KEY: ${{ secrets.APPLE_DISTRIBUTION_CERTIFICATE_KEY }}
+        BUILD_KEY_CHAIN_PASSWORD: ${{ secrets.BUILD_KEY_CHAIN_PASSWORD }}
+        BUILD_KEY_CHAIN: ${{ secrets.BUILD_KEY_CHAIN }}
+        APPLE_DISTRIBUTION_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+        KEYCHAIN_TIME: ${{ secrets.KEYCHAIN_TIME }}
+
+    - name: Install Provisioing Profile
+      run: |
+        chmod +x ./install_profile.sh
+        ./install_profile.sh
+      env:
+        DISTRIBUTION_PROVISION_UUID: ${{ secrets.DISTRIBUTION_PROVISION_UUID }}
+        DISTRIBUTION_PROVISION_KEY: ${{ secrets.DISTRIBUTION_PROVISION_KEY }}
+
+    - name: Install Bundler
+      run: sudo gem install bundler
+
+    - name: Set up Ruby environment  
+      run: |
+        sudo gem install cocoapods -v 1.15.2
+        pod repo update
+
+    - name: Install CocoaPods Dependencies
+      run: cd ios && pod install
+
+    - name: Set up Xcode
+      run: sudo xcode-select --switch /Applications/Xcode_15.2.app
+
+    - name: Unit Tests
+      run: |
+        mkdir -p test-results
+        xcodebuild test -workspace ios/lilli.xcworkspace \
+          -scheme ${{ secrets.PROD_SCHEME }} \
+          -sdk iphonesimulator \
+          -destination 'platform=iOS Simulator,name=iPhone 11' \
+          -enableCodeCoverage YES | tee test-results/unit_test_output.txt    
+
+    - name: agvtool
+      id: version
+      run: |
+        cd ios 
+        echo "BuildNumber Tag: $buildNumber"
+        echo "Sementic Tag: $new_version"
+        echo 
+        agvtool new-version -all $buildNumber
+        agvtool new-marketing-version $new_version
+
+    - name: Build the iOS app
+      run: |
+        xcodebuild clean archive -workspace ios/lilli.xcworkspace \
+          -scheme ${{ secrets.PROD_SCHEME }} \
+          -archivePath LillyArchive.xcarchive \
+          CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO | xcpretty --c
+
+    - name: Export .ipa file   
+      run: |
+        xcodebuild -exportArchive \
+          -archivePath LillyArchive.xcarchive \
+          -exportOptionsPlist ios/ExportOptions.plist \
+          -exportPath build/
+        ls -la
+        ls -la build
+
+    - name: Upload to TestFlight
+      run: |
+        xcrun altool --upload-app --type ios --file build/*.ipa --username "${{ secrets.APPLE_ID }}" --password "${{ secrets.APP_SPECIFIC_PASSWORD }}"
+        curl -X PATCH -H "Authorization: Bearer ${{ secrets.IOS_GITHUB_TOKEN }}" -H "Accept: application/vnd.github+json" https://api.github.com/repos/${{ github.repository }}/actions/variables/production_version -d '{"name": "production_version", "value": "'"$new_version"'"}'
+        curl -X PATCH -H "Authorization: Bearer ${{ secrets.IOS_GITHUB_TOKEN }}" -H "Accept: application/vnd.github+json" https://api.github.com/repos/${{ github.repository }}/actions/variables/production_build_number -d '{"name": "production_build_number", "value": "'"$buildNumber"'"}'
+        echo New Sematic Version number is $new_version upload to TestFlight
